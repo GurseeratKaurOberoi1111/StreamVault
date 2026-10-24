@@ -1,0 +1,62 @@
+[
+  {
+    "id": "bigbuckbunny",
+    "name": "Big Buck Bunny",
+    "year": 2008,
+    "genre": "Animation",
+    "duration": "10 min",
+    "description": "A gentle giant meets a mischievous forest trio.",
+    "color": "#9b6946",
+    "poster": "/assets/bigbuckbunny.svg"
+  },
+  {
+    "id": "sintel",
+    "name": "Sintel",
+    "year": 2010,
+    "genre": "Fantasy",
+    "duration": "15 min",
+    "description": "A young traveler searches for her lost dragon companion.",
+    "color": "#57476c",
+    "poster": "/assets/sintel.svg"
+  },
+  {
+    "id": "tearsofsteel",
+    "name": "Tears of Steel",
+    "year": 2012,
+    "genre": "Sci-Fi",
+    "duration": "12 min",
+    "description": "Humanity confronts a futuristic robotic threat.",
+    "color": "#37596b",
+    "poster": "/assets/tearsofsteel.svg"
+  },
+  {
+    "id": "elephantsdream",
+    "name": "Elephants Dream",
+    "year": 2006,
+    "genre": "Surreal",
+    "duration": "11 min",
+    "description": "An atmospheric journey through a strange mechanical world.",
+    "color": "#6a5561",
+    "poster": "/assets/elephantsdream.svg"
+  },
+  {
+    "id": "cosmoslaundromat",
+    "name": "Cosmos Laundromat",
+    "year": 2015,
+    "genre": "Adventure",
+    "duration": "12 min",
+    "description": "A sheep discovers a bizarre new possibility.",
+    "color": "#43665b",
+    "poster": "/assets/cosmoslaundromat.svg"
+  },
+  {
+    "id": "spring",
+    "name": "Spring",
+    "year": 2019,
+    "genre": "Fantasy",
+    "duration": "8 min",
+    "description": "A shepherd girl and her dog confront ancient spirits.",
+    "color": "#716244",
+    "poster": "/assets/spring.svg"
+  }
+]

@@ -1,0 +1,365 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: StreamVault streaming demo without CloudFront
+Resources:
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [GET, HEAD]
+            AllowedOrigins: ['*']
+            AllowedHeaders: ['*']
+  Table:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TimeToLiveSpecification:
+        AttributeName: expires
+        Enabled: true
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: app
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:DeleteItem]
+                Resource: !GetAtt Table.Arn
+              - Effect: Allow
+                Action: [s3:ListBucket]
+                Resource: !GetAtt MediaBucket.Arn
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub '${MediaBucket.Arn}/*'
+              - Effect: Allow
+                Action: [logs:CreateLogGroup]
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*:*' 
+  App:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt Role.Arn
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE: !Ref Table
+          BUCKET: !Ref MediaBucket
+      Code:
+        ZipFile: |
+          import base64
+          import hashlib
+          import hmac
+          import json
+          import math
+          import os
+          import re
+          import secrets
+          import sqlite3
+          import time
+          from http.cookies import SimpleCookie
+          from pathlib import Path
+          from urllib.parse import urlsplit
+
+          ROOT = Path(__file__).resolve().parents[1]
+          LOCAL = os.environ.get('STREAMVAULT_LOCAL') == '1'
+          ASSETS = {}
+          CATALOG = json.loads((ROOT / 'backend/catalog.json').read_text(encoding='utf-8')) if (ROOT / 'backend/catalog.json').exists() else []
+          IDS = {t['id'] for t in CATALOG}
+          _store = None
+
+          class Conflict(Exception):
+              pass
+
+          class Store:
+              def __init__(self):
+                  if LOCAL:
+                      self.path = os.environ.get('STREAMVAULT_DB', str(ROOT / 'data/streamvault.db'))
+                      Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+                      with sqlite3.connect(self.path) as c:
+                          c.execute('CREATE TABLE IF NOT EXISTS records (pk TEXT PRIMARY KEY, payload TEXT NOT NULL)')
+                  else:
+                      import boto3
+                      from botocore.config import Config
+                      self.table = boto3.resource('dynamodb').Table(os.environ['TABLE'])
+                      self.s3 = boto3.client('s3', region_name=os.environ.get('AWS_REGION'), config=Config(signature_version='s3v4'))
+
+              def get(self, key):
+                  if LOCAL:
+                      with sqlite3.connect(self.path) as c:
+                          row = c.execute('SELECT payload FROM records WHERE pk=?', (key,)).fetchone()
+                      return json.loads(row[0]) if row else None
+                  return self.table.get_item(Key={'pk': key}, ConsistentRead=True).get('Item')
+
+              def put(self, item, unique=False):
+                  if LOCAL:
+                      try:
+                          with sqlite3.connect(self.path) as c:
+                              sql = 'INSERT INTO' if unique else 'INSERT OR REPLACE INTO'
+                              c.execute(sql + ' records VALUES (?,?)', (item['pk'], json.dumps(item)))
+                      except sqlite3.IntegrityError:
+                          raise Conflict()
+                  else:
+                      from botocore.exceptions import ClientError
+                      try:
+                          args = {'Item': item}
+                          if unique:
+                              args['ConditionExpression'] = 'attribute_not_exists(pk)'
+                          self.table.put_item(**args)
+                      except ClientError as e:
+                          if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                              raise Conflict()
+                          raise
+
+              def delete(self, key):
+                  if LOCAL:
+                      with sqlite3.connect(self.path) as c:
+                          c.execute('DELETE FROM records WHERE pk=?', (key,))
+                  else:
+                      self.table.delete_item(Key={'pk': key})
+
+              def video(self, title):
+                  if LOCAL:
+                      if not (ROOT / 'media' / (title + '.mp4')).is_file():
+                          return None
+                      return '/media/' + title + '.mp4'
+                  from botocore.exceptions import ClientError
+                  key = 'videos/' + title + '.mp4'
+                  try:
+                      self.s3.head_object(Bucket=os.environ['BUCKET'], Key=key)
+                  except ClientError as e:
+                      if e.response['Error']['Code'] in ('404', 'NoSuchKey', 'NotFound'):
+                          return None
+                      raise
+                  return self.s3.generate_presigned_url('get_object', Params={'Bucket': os.environ['BUCKET'], 'Key': key}, ExpiresIn=3600)
+
+          def store():
+              global _store
+              if _store is None:
+                  _store = Store()
+              return _store
+
+          def response(code, data, content='application/json; charset=utf-8', cookies=None):
+              headers = {'content-type': content, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'referrer-policy': 'same-origin', 'x-frame-options': 'DENY'}
+              result = {'statusCode': code, 'headers': headers, 'body': json.dumps(data) if content.startswith('application/json') else data}
+              if cookies:
+                  result['cookies'] = cookies
+              return result
+
+          def token_from(event):
+              jar = SimpleCookie()
+              try:
+                  jar.load('; '.join(event.get('cookies', [])) or event.get('headers', {}).get('cookie', ''))
+                  return jar['svsession'].value if 'svsession' in jar else None
+              except Exception:
+                  return None
+
+          def session(event):
+              token = token_from(event)
+              if not token:
+                  return None
+              item = store().get('session#' + hashlib.sha256(token.encode()).hexdigest())
+              return item if item and int(item['expires']) > int(time.time()) else None
+
+          def cookie(token, age=604800):
+              return 'svsession=' + token + '; HttpOnly; SameSite=Lax; Path=/; Max-Age=' + str(age) + ('' if LOCAL else '; Secure')
+
+          def asset(path):
+              if path in ASSETS:
+                  item = ASSETS[path]
+                  return response(200, item[1], item[0])
+              allowed = {'/': ('index.html', 'text/html; charset=utf-8'), '/styles.css': ('styles.css', 'text/css; charset=utf-8'), '/app.js': ('app.js', 'text/javascript; charset=utf-8')}
+              if path in allowed:
+                  name, mime = allowed[path]
+                  return response(200, (ROOT / 'frontend' / name).read_text(encoding='utf-8'), mime)
+              if re.fullmatch(r'/assets/[a-z]+\.svg', path):
+                  p = ROOT / 'frontend' / path.lstrip('/')
+                  if p.is_file():
+                      return response(200, p.read_text(encoding='utf-8'), 'image/svg+xml')
+              return None
+
+          def handler(event, context=None):
+              try:
+                  return route(event)
+              except Exception as e:
+                  print('StreamVault error:', type(e).__name__)
+                  return response(500, {'error': 'Server error. Please try again.'})
+
+          def route(event):
+              path = event.get('rawPath', '/')
+              method = event.get('requestContext', {}).get('http', {}).get('method', 'GET')
+              headers = {k.lower(): v for k, v in event.get('headers', {}).items()}
+              if method == 'GET' and not path.startswith('/api/'):
+                  result = asset(path)
+                  return result or response(404, {'error': 'Page not found'})
+              if path == '/api/health' and method == 'GET':
+                  return response(200, {'status': 'ok', 'service': 'StreamVault', 'storage': 'SQLite' if LOCAL else 'DynamoDB'})
+              body = {}
+              if method == 'POST':
+                  if headers.get('content-type', '').split(';')[0].strip() != 'application/json':
+                      return response(415, {'error': 'Expected application/json'})
+                  origin = headers.get('origin')
+                  host = headers.get('host') or event.get('requestContext', {}).get('domainName', '')
+                  if origin and (urlsplit(origin).netloc != host or urlsplit(origin).scheme not in ('http', 'https')):
+                      return response(403, {'error': 'Cross origin request rejected'})
+                  raw = event.get('body') or '{}'
+                  if len(raw) > 16000:
+                      return response(413, {'error': 'Request too large'})
+                  try:
+                      if event.get('isBase64Encoded'):
+                          raw = base64.b64decode(raw, validate=True).decode()
+                      body = json.loads(raw)
+                      if not isinstance(body, dict):
+                          raise ValueError()
+                  except (ValueError, UnicodeError):
+                      return response(400, {'error': 'Invalid JSON object'})
+              if path == '/api/catalog' and method == 'GET':
+                  return response(200, {'titles': CATALOG})
+              if path == '/api/me' and method == 'GET':
+                  s = session(event)
+                  return response(200, {'user': s['user'] if s else None})
+              if path in ('/api/register', '/api/login') and method == 'POST':
+                  user, password = body.get('username'), body.get('password')
+                  if not isinstance(user, str) or not isinstance(password, str):
+                      return response(400, {'error': 'Enter a username and password'})
+                  user = user.strip().lower()
+                  if not re.fullmatch(r'[a-z0-9_]{3,32}', user) or not 8 <= len(password) <= 128:
+                      return response(400, {'error': 'Use 3 to 32 letters, numbers or underscores; password must have 8 to 128 characters'})
+                  if path == '/api/register':
+                      salt = secrets.token_hex(16)
+                      digest = hashlib.pbkdf2_hmac('sha256', password.encode(), bytes.fromhex(salt), 600000).hex()
+                      try:
+                          store().put({'pk': 'user#' + user, 'salt': salt, 'digest': digest}, unique=True)
+                      except Conflict:
+                          return response(409, {'error': 'That username is already taken'})
+                      return response(201, {'ok': True})
+                  item = store().get('user#' + user)
+                  salt = item['salt'] if item else '0' * 32
+                  digest = hashlib.pbkdf2_hmac('sha256', password.encode(), bytes.fromhex(salt), 600000).hex()
+                  if not item or not hmac.compare_digest(digest, item['digest']):
+                      return response(401, {'error': 'Incorrect username or password'})
+                  token = secrets.token_urlsafe(32)
+                  store().put({'pk': 'session#' + hashlib.sha256(token.encode()).hexdigest(), 'user': user, 'expires': int(time.time()) + 604800})
+                  return response(200, {'user': user}, cookies=[cookie(token)])
+              if path == '/api/logout' and method == 'POST':
+                  token = token_from(event)
+                  if token:
+                      store().delete('session#' + hashlib.sha256(token.encode()).hexdigest())
+                  return response(200, {'ok': True}, cookies=[cookie('', 0)])
+              if path not in ('/api/library', '/api/progress') and not path.startswith('/api/play/'):
+                  return response(404, {'error': 'Not found'})
+              s = session(event)
+              if not s:
+                  return response(401, {'error': 'Sign in to continue'})
+              user = s['user']
+              if path == '/api/library' and method == 'GET':
+                  library, progress = {}, {}
+                  for title in IDS:
+                      item = store().get('state#' + user + '#' + title + '#saved')
+                      if item:
+                          library[title] = bool(item['value'])
+                      item = store().get('state#' + user + '#' + title + '#progress')
+                      if item:
+                          progress[title] = int(item['value'])
+                  return response(200, {'library': library, 'progress': progress})
+              if path in ('/api/library', '/api/progress') and method == 'POST':
+                  title = body.get('id')
+                  if not isinstance(title, str) or title not in IDS:
+                      return response(400, {'error': 'Unknown title'})
+                  kind = 'saved' if path == '/api/library' else 'progress'
+                  value = body.get('saved') if kind == 'saved' else body.get('seconds')
+                  if kind == 'saved' and type(value) is not bool:
+                      return response(400, {'error': 'saved must be true or false'})
+                  if kind == 'progress':
+                      if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 100000:
+                          return response(400, {'error': 'seconds must be between 0 and 100000'})
+                      value = int(value)
+                  store().put({'pk': 'state#' + user + '#' + title + '#' + kind, 'value': value})
+                  return response(200, {'ok': True})
+              if path.startswith('/api/play/') and method == 'GET':
+                  title = path.removeprefix('/api/play/')
+                  if title not in IDS:
+                      return response(404, {'error': 'Unknown title'})
+                  url = store().video(title)
+                  if not url:
+                      return response(404, {'error': 'This film has not been uploaded yet. Add its MP4 using the deployment guide.'})
+                  return response(200, {'url': url, 'expiresIn': 3600})
+              return response(405, {'error': 'Method not allowed'})
+
+          ASSETS = {'/app.js': ['text/javascript; charset=utf-8', '\'use strict\';\nconst $ = id => document.getElementById(id);\nconst state = {titles:[],user:null,library:{},progress:{},tab:\'home\',genre:\'All films\'};\nlet toastTimer, playing = null, lastSaved = 0, authRegister = false, pendingAction = null;\nconst esc = value => String(value).replace(/[&<>"\']/g, c => ({\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\',"\'":\'&#39;\'}[c]));\nasync function api(path, method=\'GET\', body, keepalive=false) {\n  const r = await fetch(\'/api/\'+path, {method, credentials:\'same-origin\', headers:{\'Content-Type\':\'application/json\'}, body:body===undefined?undefined:JSON.stringify(body), keepalive});\n  const data = await r.json();\n  if (!r.ok) {const e = new Error(data.error || \'Request failed\'); e.status=r.status; throw e;}\n  return data;\n}\nfunction notify(message) {$(\'toast\').textContent=message; $(\'toast\').hidden=false; clearTimeout(toastTimer); toastTimer=setTimeout(()=>$(\'toast\').hidden=true,4500);}\nfunction updateAccount() {$(\'account\').textContent=state.user ? state.user+\' · Sign out\' : \'Sign in ↗\'; $(\'list-count\').textContent=Object.values(state.library).filter(Boolean).length;}\nfunction showDialog(html, player=false) {closeDialog(); $(\'dialog\').className=player?\'player-dialog\':\'\'; $(\'dialog\').innerHTML=\'<button class="close" aria-label="Close dialog">×</button>\'+html; $(\'dialog\').querySelector(\'.close\').onclick=closeDialog; $(\'dialog\').showModal(); document.body.classList.add(\'modal-open\');}\nfunction closeDialog() {\n  const video=$(\'video\');\n  if(video && playing){persist(playing,video.ended?0:Math.floor(video.currentTime),true);video.pause();}\n  playing=null; if($(\'dialog\').open)$(\'dialog\').close(); $(\'dialog\').innerHTML=\'\'; document.body.classList.remove(\'modal-open\'); render();\n}\nfunction setTab(tab){state.tab=tab;state.genre=\'All films\';render();if(tab!==\'home\')$(\'heading\').scrollIntoView({behavior:\'smooth\',block:\'start\'});}\nfunction render(){\n  updateAccount();\n  const q=$(\'search\').value.trim().toLowerCase();\n  $(\'hero\').hidden=state.tab!==\'home\'||!!q;\n  document.querySelectorAll(\'[data-tab]\').forEach(b=>{b.classList.toggle(\'active\',b.dataset.tab===state.tab);b.setAttribute(\'aria-current\',b.dataset.tab===state.tab?\'page\':\'false\');});\n  const names={home:\'The collection\',explore:\'Explore all films\',list:\'My List\',continue:\'Continue watching\'};\n  $(\'heading\').textContent=q?\'Search results\':names[state.tab];\n  $(\'subtitle\').textContent=state.tab===\'list\'?\'Your stories, ready when you are.\':state.tab===\'continue\'?\'Pick up where the story left off.\':\'Six little reasons to press play.\';\n  const genres=[\'All films\',...new Set(state.titles.map(t=>t.genre))];\n  $(\'filters\').innerHTML=genres.map(g=>`<button class="chip ${g===state.genre?\'selected\':\'\'}" aria-pressed="${g===state.genre}">${esc(g)}</button>`).join(\'\');\n  $(\'filters\').querySelectorAll(\'button\').forEach(b=>b.onclick=()=>{state.genre=b.textContent;render();});\n  let list=state.titles.filter(t=>(t.name+\' \'+t.genre+\' \'+t.description).toLowerCase().includes(q)&&(state.genre===\'All films\'||t.genre===state.genre));\n  if(state.tab===\'list\')list=list.filter(t=>state.library[t.id]);\n  if(state.tab===\'continue\')list=list.filter(t=>state.progress[t.id]>0);\n  $(\'status\').textContent=!state.user&&[\'list\',\'continue\'].includes(state.tab)?\'Sign in to see your saved stories.\':list.length?\'\':\'No films here yet. Try another filter or add a film to your list.\';\n  $(\'cards\').innerHTML=list.map(t=>`<article class="card"><div class="poster"><img src="${esc(t.poster)}" alt="${esc(t.name)} original landscape artwork" loading="lazy"><span class="poster-tag">${esc(t.genre.toUpperCase())}</span><button class="poster-play" data-play="${t.id}" aria-label="Play ${esc(t.name)}"><span class="play-circle">▶</span></button><span class="duration">${esc(t.duration)}</span></div><div class="card-info"><div><h3>${esc(t.name)}</h3><div class="card-meta">${t.year} &nbsp;·&nbsp; ${esc(t.genre)} &nbsp;·&nbsp; Short film</div></div><button class="save ${state.library[t.id]?\'saved\':\'\'}" data-save="${t.id}" aria-label="${state.library[t.id]?\'Remove\':\'Save\'} ${esc(t.name)}" aria-pressed="${!!state.library[t.id]}">${state.library[t.id]?\'✓\':\'+\'}</button></div><p class="description">${esc(t.description)}</p>${state.progress[t.id]>0?`<p class="resume">↻ Resume from ${formatTime(state.progress[t.id])}</p>`:\'\'}</article>`).join(\'\');\n  $(\'cards\').querySelectorAll(\'[data-play]\').forEach(b=>b.onclick=()=>play(b.dataset.play));\n  $(\'cards\').querySelectorAll(\'[data-save]\').forEach(b=>b.onclick=()=>save(b.dataset.save,b));\n}\nconst formatTime=s=>Math.floor(s/60)+\':\'+String(s%60).padStart(2,\'0\');\nasync function loadLibrary(){const data=await api(\'library\');state.library=data.library;state.progress=data.progress;}\nfunction auth(register=false, after=null){authRegister=register;if(after)pendingAction=after;\n  showDialog(`<p class="eyebrow">WELCOME TO STREAMVAULT</p><h2>${register?\'Your next story starts here.\':\'Good to see you.\'}</h2><p class="muted">${register?\'Create an account to save films and resume watching.\':\'Sign in to your personal collection.\'}</p><form id="auth-form"><label for="username">Username</label><input id="username" name="username" autocomplete="username" required minlength="3" maxlength="32" pattern="[A-Za-z0-9_]+"><label for="password">Password</label><input id="password" name="password" type="password" autocomplete="${register?\'new-password\':\'current-password\'}" required minlength="8" maxlength="128"><p id="form-error" role="alert"></p><button class="button primary wide" type="submit">${register?\'Create account\':\'Sign in\'} ↗</button></form><button class="switch" id="auth-switch">${register?\'Already a member? Sign in\':\'New here? Create an account\'}</button>`);\n  $(\'auth-switch\').onclick=()=>auth(!authRegister);\n  $(\'auth-form\').onsubmit=async e=>{e.preventDefault();const button=e.target.querySelector(\'button\');button.disabled=true;$(\'form-error\').textContent=\'\';try{const data={username:$(\'username\').value,password:$(\'password\').value};if(authRegister)await api(\'register\',\'POST\',data);state.user=(await api(\'login\',\'POST\',data)).user;await loadLibrary();closeDialog();render();notify(\'Welcome, \'+state.user);const action=pendingAction;pendingAction=null;if(action)await action();}catch(err){if($(\'form-error\'))$(\'form-error\').textContent=err.message;}finally{button.disabled=false;}};\n}\nasync function save(id,button){if(!state.user){auth(false,()=>save(id));return;}if(button)button.disabled=true;try{const saved=!state.library[id];await api(\'library\',\'POST\',{id,saved});state.library[id]=saved;render();notify(saved?\'Added to My List\':\'Removed from My List\');}catch(e){if(e.status===401){state.user=null;auth(false,()=>save(id));}else notify(e.message);}finally{if(button)button.disabled=false;}}\nasync function play(id){\n  if(!state.user){auth(false,()=>play(id));return;}\n  try{const data=await api(\'play/\'+id);const title=state.titles.find(t=>t.id===id);\n    showDialog(`<p class="eyebrow">NOW PLAYING</p><h2>${esc(title.name)}</h2><video id="video" controls playsinline preload="metadata"></video><p class="muted">${esc(title.description)}</p><p id="player-error" role="alert" class="muted"></p>`,true);\n    playing=id;lastSaved=Date.now();const video=$(\'video\');video.src=data.url;\n    video.onloadedmetadata=()=>{if(state.progress[id])video.currentTime=Math.min(state.progress[id],Math.max(0,video.duration-1));video.play().catch(()=>{});};\n    video.ontimeupdate=()=>{if(Date.now()-lastSaved>10000){lastSaved=Date.now();persist(id,Math.floor(video.currentTime));}};\n    video.onpause=()=>{if(playing===id)persist(id,video.ended?0:Math.floor(video.currentTime));};\n    video.onended=()=>persist(id,0);\n    video.onerror=()=>{$(\'player-error\').textContent=\'Playback could not start. Check the uploaded file uses MP4 with H.264 video and AAC audio, then reopen the film.\';};\n  }catch(e){if(e.status===401){state.user=null;auth(false,()=>play(id));}else notify(e.message);}\n}\nasync function persist(id,seconds,keepalive=false){if(!state.user)return;state.progress[id]=seconds;try{await api(\'progress\',\'POST\',{id,seconds},keepalive);}catch(e){if(!keepalive)notify(\'Progress could not be saved. \'+e.message);}}\n$(\'account\').onclick=()=>{if(!state.user){pendingAction=null;auth();return;}showDialog(\'<h2>See you next time.</h2><p class="muted">Your list and viewing progress will be waiting for you.</p><button id="signout" class="button primary wide">Sign out</button>\');$(\'signout\').onclick=async()=>{try{await api(\'logout\',\'POST\',{});state.user=null;state.library={};state.progress={};pendingAction=null;closeDialog();render();notify(\'Signed out\');}catch(e){notify(e.message);}};};\n$(\'dialog\').addEventListener(\'cancel\',e=>{e.preventDefault();pendingAction=null;closeDialog();});\ndocument.querySelectorAll(\'[data-tab]\').forEach(b=>b.onclick=()=>setTab(b.dataset.tab));\n$(\'search\').oninput=render;$(\'featured-play\').onclick=()=>play(\'sintel\');$(\'browse\').onclick=()=>setTab(\'explore\');\ndocument.addEventListener(\'visibilitychange\',()=>{const v=$(\'video\');if(document.hidden&&v&&playing)persist(playing,v.ended?0:Math.floor(v.currentTime),true);});\n(async()=>{try{state.titles=(await api(\'catalog\')).titles;state.user=(await api(\'me\')).user;if(state.user)await loadLibrary();render();}catch(e){$(\'status\').textContent=\'Unable to load StreamVault. \'+e.message;}})();\n'], '/assets/bigbuckbunny.svg': ['image/svg+xml', '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="400" viewBox="0 0 640 400"><defs><linearGradient id="sky" x2="0" y2="1"><stop stop-color="#5b7551"/><stop offset="1" stop-color="#c7d19e"/></linearGradient><linearGradient id="shade" x2="0" y2="1"><stop stop-color="#223e30" stop-opacity="0"/><stop offset="1" stop-color="#223e30"/></linearGradient></defs><rect width="640" height="400" fill="url(#sky)"/><circle cx="505" cy="75" r="42" fill="#e6e6bb"/><path d="M0 200Q130 80 260 190T640 160V400H0" fill="#799662"/><path d="M0 230Q170 150 340 240T640 200V400H0" fill="#3f653e"/><rect width="640" height="400" fill="url(#shade)"/><text x="320" y="308" text-anchor="middle" fill="#f0eeda" font-family="Georgia,serif" font-size="45" letter-spacing="5">BIG BUCK BUNNY</text><text x="320" y="340" text-anchor="middle" fill="#d0d4bf" font-family="Arial,sans-serif" font-size="9" letter-spacing="4">THE STREAMVAULT COLLECTION</text></svg>'], '/assets/cosmoslaundromat.svg': ['image/svg+xml', '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="400" viewBox="0 0 640 400"><defs><linearGradient id="sky" x2="0" y2="1"><stop stop-color="#655776"/><stop offset="1" stop-color="#a6a1bc"/></linearGradient><linearGradient id="shade" x2="0" y2="1"><stop stop-color="#272b42" stop-opacity="0"/><stop offset="1" stop-color="#272b42"/></linearGradient></defs><rect width="640" height="400" fill="url(#sky)"/><circle cx="450" cy="100" r="65" fill="#c9be9d"/><ellipse cx="450" cy="100" rx="120" ry="20" fill="none" stroke="#c1b49d" stroke-width="10" transform="rotate(-24 450 100)"/><path d="M0 250Q130 170 300 260T640 210V400H0" fill="#596451"/><path d="M0 300Q200 210 450 320L640 270V400H0" fill="#354b3b"/><rect width="640" height="400" fill="url(#shade)"/><text x="320" y="308" text-anchor="middle" fill="#f0eeda" font-family="Georgia,serif" font-size="34" letter-spacing="5">COSMOS LAUNDROMAT</text><text x="320" y="340" text-anchor="middle" fill="#d0d4bf" font-family="Arial,sans-serif" font-size="9" letter-spacing="4">THE STREAMVAULT COLLECTION</text></svg>'], '/assets/elephantsdream.svg': ['image/svg+xml', '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="400" viewBox="0 0 640 400"><defs><linearGradient id="sky" x2="0" y2="1"><stop stop-color="#4b4243"/><stop offset="1" stop-color="#b4a18b"/></linearGradient><linearGradient id="shade" x2="0" y2="1"><stop stop-color="#27272b" stop-opacity="0"/><stop offset="1" stop-color="#27272b"/></linearGradient></defs><rect width="640" height="400" fill="url(#sky)"/><g fill="none" stroke="#c3b092" opacity=".4"><circle cx="450" cy="140" r="95" stroke-width="9"/><circle cx="450" cy="140" r="55" stroke-width="15"/><path d="M0 280H230V140H450V0M300 400V270H640" stroke-width="17"/></g><path d="M0 310L640 230V400H0" fill="#2c3030"/><rect width="640" height="400" fill="url(#shade)"/><text x="320" y="308" text-anchor="middle" fill="#f0eeda" font-family="Georgia,serif" font-size="45" letter-spacing="5">ELEPHANTS DREAM</text><text x="320" y="340" text-anchor="middle" fill="#d0d4bf" font-family="Arial,sans-serif" font-size="9" letter-spacing="4">THE STREAMVAULT COLLECTION</text></svg>'], '/assets/sintel.svg': ['image/svg+xml', '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="400" viewBox="0 0 640 400"><defs><linearGradient id="sky" x2="0" y2="1"><stop stop-color="#263e39"/><stop offset="1" stop-color="#879b7c"/></linearGradient><linearGradient id="shade" x2="0" y2="1"><stop stop-color="#112923" stop-opacity="0"/><stop offset="1" stop-color="#112923"/></linearGradient></defs><rect width="640" height="400" fill="url(#sky)"/><circle cx="470" cy="90" r="67" fill="#d7dab2"/><path d="M0 300L150 90 230 190 330 60 470 230 550 130 640 300V400H0" fill="#3e5d50"/><path d="M0 300L210 210 330 280 430 170 640 310V400H0" fill="#1c3a30"/><rect width="640" height="400" fill="url(#shade)"/><text x="320" y="308" text-anchor="middle" fill="#f0eeda" font-family="Georgia,serif" font-size="45" letter-spacing="5">SINTEL</text><text x="320" y="340" text-anchor="middle" fill="#d0d4bf" font-family="Arial,sans-serif" font-size="9" letter-spacing="4">THE STREAMVAULT COLLECTION</text></svg>'], '/assets/spring.svg': ['image/svg+xml', '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="400" viewBox="0 0 640 400"><defs><linearGradient id="sky" x2="0" y2="1"><stop stop-color="#53684d"/><stop offset="1" stop-color="#b9c899"/></linearGradient><linearGradient id="shade" x2="0" y2="1"><stop stop-color="#253d33" stop-opacity="0"/><stop offset="1" stop-color="#253d33"/></linearGradient></defs><rect width="640" height="400" fill="url(#sky)"/><circle cx="430" cy="90" r="55" fill="#e0d9a1"/><g fill="#3b6144"><path d="M30 300L100 40 170 300ZM130 300L215 80 300 300ZM400 300L485 25 570 300ZM510 300L590 75 670 300Z"/></g><path d="M0 300Q300 180 640 280V400H0" fill="#2a4936"/><rect width="640" height="400" fill="url(#shade)"/><text x="320" y="308" text-anchor="middle" fill="#f0eeda" font-family="Georgia,serif" font-size="45" letter-spacing="5">SPRING</text><text x="320" y="340" text-anchor="middle" fill="#d0d4bf" font-family="Arial,sans-serif" font-size="9" letter-spacing="4">THE STREAMVAULT COLLECTION</text></svg>'], '/assets/tearsofsteel.svg': ['image/svg+xml', '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="400" viewBox="0 0 640 400"><defs><linearGradient id="sky" x2="0" y2="1"><stop stop-color="#374f5c"/><stop offset="1" stop-color="#819a9b"/></linearGradient><linearGradient id="shade" x2="0" y2="1"><stop stop-color="#162932" stop-opacity="0"/><stop offset="1" stop-color="#162932"/></linearGradient></defs><rect width="640" height="400" fill="url(#sky)"/><circle cx="470" cy="100" r="50" fill="#c9c9a7"/><path d="M0 250V150H50V210H100V80H140V240H200V130H245V230H280V60H310V210H350V110H410V250H480V150H530V190H580V100H640V400H0" fill="#253e49"/><path d="M300 400L370 230 445 400" fill="#9bb1a0" opacity=".4"/><rect width="640" height="400" fill="url(#shade)"/><text x="320" y="308" text-anchor="middle" fill="#f0eeda" font-family="Georgia,serif" font-size="45" letter-spacing="5">TEARS OF STEEL</text><text x="320" y="340" text-anchor="middle" fill="#d0d4bf" font-family="Arial,sans-serif" font-size="9" letter-spacing="4">THE STREAMVAULT COLLECTION</text></svg>'], '/': ['text/html; charset=utf-8', '<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">\n<meta name="theme-color" content="#10110e"><meta name="description" content="A curated collection of imaginative short films. Discover, save and watch with StreamVault.">\n<title>StreamVault | A world of stories</title>\n<link rel="stylesheet" href="/styles.css"><script src="/app.js" defer></script>\n</head>\n<body>\n<header class="top"><a class="brand" href="/" aria-label="StreamVault home"><span class="brand-icon">▷</span> streamvault<span class="brand-dot">.</span></a><nav aria-label="Main navigation"><button class="nav active" data-tab="home">Discover</button><button class="nav" data-tab="explore">Explore</button><button class="nav" data-tab="list">My List <span id="list-count">0</span></button><button class="nav" data-tab="continue">Continue Watching</button></nav><div class="account-area"><button id="account" class="button outline">Sign in <span>↗</span></button></div></header>\n<main>\n<section class="hero" id="hero"><div class="hero-grain"></div><div class="hero-copy"><p class="eyebrow"><span></span> THE STREAMVAULT COLLECTION</p><h1>Small films.<br><em>Endless worlds.</em></h1><p class="hero-description">Extraordinary stories for your everyday escape.<br>A handpicked collection of independent short films.</p><div class="hero-actions"><button id="featured-play" class="button primary">▶ &nbsp; Watch Sintel</button><button id="browse" class="button glass">Explore collection <span>↗</span></button></div><div class="hero-meta"><span>2010</span><span>Fantasy</span><span>15 minutes</span><span class="quality">HD</span></div></div><div class="hero-art" aria-hidden="true"><div class="moon"></div><div class="ridge far"></div><div class="ridge near"></div><div class="hero-caption"><span>FEATURED FILM</span><strong>SINTEL</strong><small>A search that changes everything.</small></div><div class="hero-number">01 <span>/ 06</span></div></div></section>\n<section class="collection"><div class="section-head"><div><p class="eyebrow">YOUR NEXT ESCAPE</p><h2 id="heading">The collection<span class="accent">.</span></h2><p id="subtitle" class="muted">Six little reasons to press play.</p></div><label class="search"><span aria-hidden="true">⌕</span><input id="search" type="search" placeholder="Find your next story" aria-label="Search films"></label></div><div class="filter-row" id="filters" aria-label="Filter by genre"></div><div id="status" role="status" class="status">Loading the collection…</div><div id="cards" class="cards"></div></section>\n<section class="manifesto"><div class="outline-star" aria-hidden="true">✳</div><div><p class="eyebrow">LESS SCROLLING. MORE STORIES.</p><h2>Great stories don’t<br>need a whole evening.</h2><p class="muted">A small collection. A world of imagination.<br>Find something that stays with you.</p></div><span class="manifesto-index">SV / 001</span></section>\n</main>\n<footer><a class="brand" href="/">streamvault<span class="brand-dot">.</span></a><p>A curated short film streaming platform.</p><span>Made for the love of stories &nbsp; © 2026</span></footer>\n<dialog id="dialog" aria-label="StreamVault dialog"></dialog><div id="toast" class="toast" role="status" hidden></div>\n</body></html>\n'], '/styles.css': ['text/css; charset=utf-8', ":root{color-scheme:dark;font-family:Arial,Helvetica,sans-serif;color:#f1f0e9;background:#10110e;--lime:#d2e78a;--muted:#a0a398}*{box-sizing:border-box}body{margin:0}button,input{font:inherit}button,a{-webkit-tap-highlight-color:transparent}button{cursor:pointer}button:disabled{cursor:wait;opacity:.6}a{color:inherit;text-decoration:none}button:focus-visible,a:focus-visible,input:focus-visible{outline:2px solid var(--lime);outline-offset:4px}.top{min-height:96px;display:flex;align-items:center;gap:5%;padding:20px 5%;border-bottom:1px solid #ffffff12}.brand{font-size:26px;font-weight:700;letter-spacing:-1.2px;white-space:nowrap}.brand-dot{color:var(--lime)}.brand-icon{display:inline-grid;place-items:center;background:var(--lime);color:#10110e;border-radius:50%;height:30px;width:30px;font-size:22px;margin-right:7px;vertical-align:middle}.top nav{display:flex;gap:25px}.nav{background:none;border:0;color:var(--muted);font-size:13px;padding:12px 0}.nav.active{color:var(--lime)}#list-count{font-size:10px;background:#2b3021;padding:3px 5px;border-radius:4px;margin-left:3px}.account-area{margin-left:auto}.button{border-radius:5px;padding:14px 21px;font-size:13px;font-weight:600;border:1px solid transparent;display:inline-flex;align-items:center;justify-content:center;gap:18px}.primary{background:var(--lime);color:#171b10}.primary:hover{background:#e4f4af}.outline{border-color:#55594b;background:transparent;color:#eeefe8}.glass{background:#ffffff0d;border-color:#ffffff2e;color:#f1f0e9}.hero{margin:30px 4% 0;min-height:520px;position:relative;isolation:isolate;display:flex;overflow:hidden;background:#212920;border:1px solid #ffffff0c;border-radius:9px}.hero-grain{position:absolute;inset:0;background:radial-gradient(ellipse at 65% 0%,#6c79504a,transparent 65%);z-index:-1}.hero-copy{padding:65px 5%;width:60%;z-index:2;background:linear-gradient(90deg,#1c251e 20%,#1c251eeb 60%,transparent)}.eyebrow{font-size:10px;letter-spacing:2.5px;font-weight:700;color:#bec9a6;margin:0 0 20px}.eyebrow span{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--lime);margin-right:8px}.hero h1{font-size:clamp(40px,5vw,75px);font-weight:500;letter-spacing:-3px;line-height:1.06;margin:0 0 22px}.hero h1 em{font-family:Georgia,serif;font-weight:400;color:var(--lime)}.hero-description{font-size:14px;line-height:1.8;color:#bac3b5;margin-bottom:29px}.hero-actions{display:flex;gap:10px;flex-wrap:wrap}.hero-meta{display:flex;gap:14px;font-size:10px;letter-spacing:.4px;color:#b9c0ae;margin-top:30px;align-items:center}.hero-meta>span+span:before{content:'·';margin-right:14px}.hero-meta .quality{border:1px solid #99a387;padding:3px;border-radius:2px;font-size:8px}.hero-meta .quality:before{content:none}.hero-art{position:absolute;inset:0 0 0 40%;background:radial-gradient(ellipse at 60% 35%,#748665 0%,#415544 43%,#14251e 80%);overflow:hidden;z-index:-1}.moon{width:210px;height:210px;background:linear-gradient(130deg,#e0dfac,#c3cb97);border-radius:50%;position:absolute;top:45px;left:40%;box-shadow:0 0 100px #d8dfa326}.ridge{position:absolute;inset:0;background:#253a31;clip-path:polygon(0 85%,12% 69%,22% 74%,39% 28%,48% 51%,56% 36%,67% 72%,83% 30%,100% 68%,100% 100%,0 100%)}.ridge.far{opacity:.75;transform:translateY(45px)}.ridge.near{background:linear-gradient(140deg,#213c30,#101e19);clip-path:polygon(0 95%,14% 100%,36% 85%,56% 61%,66% 85%,81% 74%,100% 94%,100% 100%,0 100%)}.hero-caption{position:absolute;right:11%;top:63%;text-align:center;transform:rotate(-4deg)}.hero-caption span{font-size:8px;letter-spacing:4px;color:#c9d3b4}.hero-caption strong{display:block;font-family:Georgia,serif;font-size:65px;letter-spacing:12px;color:#e0e2c3;font-weight:400;margin-top:6px}.hero-caption small{font-size:9px;letter-spacing:1px;color:#b4c5ac}.hero-number{position:absolute;bottom:30px;right:28px;font-size:12px;color:#eee}.hero-number span{color:#849580;font-size:10px;margin-left:10px}.collection{padding:56px 5% 50px}.section-head{display:flex;justify-content:space-between;align-items:center;gap:20px}.section-head .eyebrow{font-size:9px;margin-bottom:12px;color:#83946a}h2{font-weight:500;font-size:33px;letter-spacing:-1px;margin:0 0 12px}.accent{color:var(--lime)}.muted{color:var(--muted);font-size:12px;line-height:1.8;margin:0}.search{display:flex;align-items:center;gap:10px;border-bottom:1px solid #4a4f40;padding:10px 0;color:#afb69f}.search span{font-size:25px}.search input{width:195px;border:0;background:none;color:#eee;font-size:12px;outline:none}.filter-row{display:flex;gap:8px;flex-wrap:wrap;margin:28px 0 25px}.chip{border:1px solid #34382d;color:#a7ae9b;background:transparent;border-radius:24px;padding:9px 17px;font-size:11px}.chip.selected{background:#d2e78a;color:#1c2312;border-color:#d2e78a}.cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:30px 24px}.card{min-width:0}.poster{height:auto;aspect-ratio:1.65;position:relative;border-radius:6px;overflow:hidden;background:#293427}.poster img{width:100%;height:100%;object-fit:cover;transition:transform .4s}.card:hover .poster img{transform:scale(1.035)}.poster:after{content:'';position:absolute;inset:40% 0 0;background:linear-gradient(transparent,#0009);pointer-events:none}.poster-play{position:absolute;inset:0;z-index:1;border:0;background:transparent;color:white;display:grid;place-items:center}.play-circle{border:1px solid #ffffff87;background:#ffffff0f;backdrop-filter:blur(6px);border-radius:50%;height:45px;width:45px;display:grid;place-items:center;opacity:0;transform:scale(.85);transition:.2s}.poster-play:focus-visible .play-circle,.poster-play:hover .play-circle{opacity:1;transform:scale(1)}.poster-tag{position:absolute;top:12px;left:12px;background:#10180c80;color:#ecf1df;font-size:8px;letter-spacing:1px;padding:6px 8px;z-index:2;pointer-events:none}.duration{position:absolute;right:12px;bottom:12px;font-size:9px;z-index:2;pointer-events:none}.card-info{display:flex;align-items:start;justify-content:space-between;gap:10px;margin:15px 0 7px}.card h3{font-size:15px;font-weight:500;margin:0 0 7px}.card-meta{font-size:10px;color:#919b85}.save{border:1px solid #394031;border-radius:50%;width:29px;height:29px;background:none;color:#bcc5ae;font-size:18px}.save.saved{color:var(--lime);border-color:#6c7d4e}.description{color:#9ba48f;font-size:11px;line-height:1.6;margin:0}.resume{font-size:10px;color:var(--lime);margin-top:9px}.status{color:#bac2ab;font-size:13px;line-height:1.8;padding:20px 0}.status:empty{display:none}.manifesto{margin:12px 5% 65px;border-top:1px solid #383e2e;border-bottom:1px solid #383e2e;padding:40px 0;display:flex;gap:40px;align-items:center}.manifesto h2{font-size:30px;line-height:1.2}.manifesto .eyebrow{font-size:8px;color:#98a77c;margin-bottom:14px}.outline-star{color:var(--lime);font-size:110px;line-height:1}.manifesto-index{margin-left:auto;align-self:end;color:#5f6b50;font-size:10px;letter-spacing:3px}footer{display:flex;align-items:center;gap:30px;padding:24px 5%;border-top:1px solid #262d1f}footer .brand{font-size:20px}footer p,footer>span{font-size:10px;color:#808b73}footer>span{margin-left:auto}dialog{border:1px solid #47523b;background:#1b2017;color:#f1f0e9;border-radius:10px;width:min(430px,calc(100% - 30px));padding:30px;max-height:90vh;overflow:auto}dialog::backdrop{background:#060a06db;backdrop-filter:blur(5px)}dialog h2{font-size:28px;margin-top:12px}dialog .close{position:absolute;top:12px;right:16px;color:#d2d8c6;border:0;background:none;font-size:25px;padding:5px}dialog label{font-size:11px;color:#b8c2a6;display:block;margin:20px 0 8px}dialog input{padding:13px;border:1px solid #46503b;border-radius:4px;color:white;background:#10150d;width:100%}dialog .wide{width:100%;margin-top:20px}dialog .switch{width:100%;background:none;border:0;color:#c7d5af;font-size:11px;margin-top:18px;padding:10px}#form-error{font-size:12px;color:#ffb3a8;line-height:1.5}.player-dialog{width:min(1000px,calc(100% - 30px));padding:25px}.player-dialog video{width:100%;max-height:65vh;display:block;background:black;margin-top:20px}.player-dialog .muted{margin-top:10px}.toast{position:fixed;z-index:10;bottom:25px;left:50%;transform:translateX(-50%);max-width:90vw;background:#d2e78a;color:#1a2311;border-radius:5px;padding:13px 22px;font-size:12px;box-shadow:0 8px 40px #0008}body.modal-open{overflow:hidden}@media(min-width:1500px){main{max-width:1600px;margin:auto}}@media(max-width:1000px){.top{gap:25px;flex-wrap:wrap}.top nav{gap:20px;order:3;width:100%;overflow-x:auto;white-space:nowrap}.hero-copy{width:75%;padding:48px 6%}.hero{min-height:470px}.hero-art{left:25%}.hero-caption{right:3%;top:70%}.hero-caption strong{font-size:45px}.cards{gap:25px 18px}.hero h1{font-size:57px}}@media(max-width:650px){.top{padding:18px 5%;gap:12px}.brand{font-size:22px}.top .button{padding:10px 13px;font-size:11px}.top nav{gap:23px}.nav{font-size:11px;padding-bottom:3px}.hero{margin:15px 4% 0;min-height:490px}.hero-copy{width:100%;padding:38px 6%;background:linear-gradient(90deg,#1c251ef5,#1c251e88)}.hero h1{font-size:48px;letter-spacing:-2px}.hero-description{font-size:12px}.hero-art{left:0;opacity:.7}.moon{left:55%;top:30px;width:170px;height:170px}.hero-caption{display:none}.hero-actions .button{font-size:11px;padding:13px 12px;gap:8px}.hero-meta{margin-top:30px}.collection{padding-top:36px}.section-head{align-items:start;flex-direction:column}.search{width:100%}.search input{width:100%}.cards{grid-template-columns:repeat(2,minmax(0,1fr));gap:28px 14px}.poster{aspect-ratio:.85}.poster img{object-fit:cover}.card h3{font-size:13px;line-height:1.3}.card-meta{font-size:9px;line-height:1.5}.description{font-size:10px}.poster-tag{font-size:7px;left:8px;top:8px}.duration{font-size:8px;right:8px;bottom:8px}.play-circle{opacity:1;height:35px;width:35px}.manifesto{gap:20px;padding:30px 0;margin-bottom:35px}.outline-star{font-size:70px}.manifesto h2{font-size:23px}.manifesto-index{display:none}footer{flex-wrap:wrap;gap:8px 20px}footer>span{margin:0;width:100%}h2{font-size:29px}}\n\n[hidden]{display:none!important}\n"]}
+          CATALOG = [{'id': 'bigbuckbunny', 'name': 'Big Buck Bunny', 'year': 2008, 'genre': 'Animation', 'duration': '10 min', 'description': 'A gentle giant meets a mischievous forest trio.', 'color': '#9b6946', 'poster': '/assets/bigbuckbunny.svg'}, {'id': 'sintel', 'name': 'Sintel', 'year': 2010, 'genre': 'Fantasy', 'duration': '15 min', 'description': 'A young traveler searches for her lost dragon companion.', 'color': '#57476c', 'poster': '/assets/sintel.svg'}, {'id': 'tearsofsteel', 'name': 'Tears of Steel', 'year': 2012, 'genre': 'Sci-Fi', 'duration': '12 min', 'description': 'Humanity confronts a futuristic robotic threat.', 'color': '#37596b', 'poster': '/assets/tearsofsteel.svg'}, {'id': 'elephantsdream', 'name': 'Elephants Dream', 'year': 2006, 'genre': 'Surreal', 'duration': '11 min', 'description': 'An atmospheric journey through a strange mechanical world.', 'color': '#6a5561', 'poster': '/assets/elephantsdream.svg'}, {'id': 'cosmoslaundromat', 'name': 'Cosmos Laundromat', 'year': 2015, 'genre': 'Adventure', 'duration': '12 min', 'description': 'A sheep discovers a bizarre new possibility.', 'color': '#43665b', 'poster': '/assets/cosmoslaundromat.svg'}, {'id': 'spring', 'name': 'Spring', 'year': 2019, 'genre': 'Fantasy', 'duration': '8 min', 'description': 'A shepherd girl and her dog confront ancient spirits.', 'color': '#716244', 'poster': '/assets/spring.svg'}]
+          IDS = {t["id"] for t in CATALOG}
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      ProtocolType: HTTP
+      Name: StreamVault-HTTP-API
+  Integration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt App.Arn
+      PayloadFormatVersion: '2.0'
+  Route:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: '$default'
+      Target: !Sub 'integrations/${Integration}'
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+  Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref App
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*'
+Outputs:
+  WebsiteURL:
+    Description: StreamVault website
+    Value: !GetAtt HttpApi.ApiEndpoint
+  MediaBucketName:
+    Description: Upload MP4s to videos/ID.mp4
+    Value: !Ref MediaBucket
+  TableName:
+    Description: DynamoDB table for users, sessions and viewing state
+    Value: !Ref Table
+  FunctionName:
+    Description: StreamVault application function
+    Value: !Ref App
